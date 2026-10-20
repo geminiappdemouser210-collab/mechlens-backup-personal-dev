@@ -101,6 +101,63 @@ def test_neuron_results_layer0_projected_with_ln_uses_helper_path():
     assert out.device.type == "cpu"
 
 
+# --- the `device` argument on every allocation site ----------------------------------------------
+
+
+@pytest.mark.parametrize("site", ["head", "neuron", "neuron_projected_ln"])
+def test_call_device_overrides_constructor_device(site):
+    """Call-level device wins at all three sites; the constructor device is 'meta' to prove it."""
+    cache = _cache(device="meta")
+    direction = torch.randn(D_MODEL, 2)
+    if site == "head":
+        out = cache.stack_head_results(layer=0, device="cpu")
+    elif site == "neuron":
+        out = cache.stack_neuron_results(layer=0, device="cpu")
+    else:
+        out = cache.stack_neuron_results(
+            layer=0, project_output_onto=direction, apply_ln=True, device="cpu"
+        )
+    assert out.shape[0] == 0
+    assert out.device.type == "cpu"
+
+
+@pytest.mark.parametrize("site", ["head", "neuron", "neuron_projected_ln"])
+def test_constructor_device_used_when_call_omits_it(site):
+    cache = _cache(device=torch.device("cpu"))
+    direction = torch.randn(D_MODEL, 2)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # no inference → no FutureWarning
+        if site == "head":
+            out = cache.stack_head_results(layer=0)
+        elif site == "neuron":
+            out = cache.stack_neuron_results(layer=0)
+        else:
+            out = cache.stack_neuron_results(layer=0, project_output_onto=direction, apply_ln=True)
+    assert out.device == torch.device("cpu")
+
+
+def test_device_argument_accepts_str_and_torch_device():
+    cache = _cache(device="meta")
+    assert cache.stack_head_results(layer=0, device="cpu").device.type == "cpu"
+    assert cache.stack_head_results(layer=0, device=torch.device("cpu")).device.type == "cpu"
+
+
+def test_call_device_does_not_mutate_cache_device():
+    cache = _cache(device="meta")
+    cache.stack_head_results(layer=0, device="cpu")
+    assert cache.device == torch.device("meta")
+
+
+def test_empty_stack_concats_with_cache_tensors():
+    """The point of the fix: the placeholder must be cat-able with real cache-derived stacks."""
+    cache = _cache(dtype=torch.bfloat16, device="cpu")
+    empty = cache.stack_head_results(layer=0)
+    resid = cache["blocks.0.hook_resid_post"][None]
+    stacked = torch.cat([empty, resid], dim=0)
+    assert stacked.shape == (1, 1, POS, D_MODEL)
+    assert stacked.dtype == torch.bfloat16
+
+
 # --- device resolution order and the inference FutureWarning -------------------------------------
 
 
