@@ -135,3 +135,30 @@ def test_cfg_device_is_never_consulted():
     cache.model.cfg.device = "not-a-device"
     cache.stack_head_results(layer=0)
     cache.stack_neuron_results(layer=0)
+
+
+# --- repr and __getitem__ ------------------------------------------------------------------------
+
+
+def test_repr_short_cache_lists_all_keys():
+    cache = ActivationCache({"hook_embed": torch.zeros(1)}, _stub_model())
+    assert repr(cache) == "ActivationCache with keys ['hook_embed']"
+
+
+def test_repr_long_cache_is_truncated_with_count():
+    cache_dict = {f"blocks.{i}.hook_resid_post": torch.zeros(1) for i in range(40)}
+    text = repr(ActivationCache(cache_dict, _stub_model()))
+    assert text.startswith("ActivationCache with 40 keys [")
+    assert "'blocks.0.hook_resid_post'" in text
+    assert "'blocks.39.hook_resid_post'" not in text
+    assert "+32 more" in text
+    assert len(text) < 400
+
+
+def test_getitem_accepts_full_name_shorthand_and_tuples():
+    cache = _cache(device="cpu")
+    full = cache["blocks.0.hook_resid_post"]
+    assert cache[("resid_post", 0)] is full
+    assert cache[("resid_post", -N_LAYERS)] is full  # negative layer index
+    assert cache[("z", 0, "attn")] is cache["blocks.0.attn.hook_z"]
+    assert cache["embed"] is cache["hook_embed"]
