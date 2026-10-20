@@ -14,6 +14,7 @@ back to these docs depending on what you need to do.
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -134,6 +135,12 @@ class ActivationCache:
             The model that the activations are from.
         has_batch_dim:
             Whether the activations have a batch dimension.
+        device:
+            Device for tensors the cache allocates itself (the empty stacks returned by
+            ``stack_head_results`` / ``stack_neuron_results`` at layer 0). Optional; when omitted
+            and not set by ``to()``, it is inferred from the cached activations with a
+            ``FutureWarning``. ``model.cfg.device`` is never used, since it diverges from the
+            cache after ``cache.to()`` and on Bridge or meta-loaded models.
     """
 
     def __init__(
@@ -141,6 +148,7 @@ class ActivationCache:
         cache_dict: Dict[str, torch.Tensor],
         model: Any,
         has_batch_dim: bool = True,
+        device: Optional[Union[str, torch.device]] = None,
     ):
         self.cache_dict = cache_dict
         # Helper methods require HT-internal structure; bridge users only use cache_dict.
@@ -148,8 +156,34 @@ class ActivationCache:
         self.has_batch_dim = has_batch_dim
         self.has_embed = "hook_embed" in self.cache_dict
         self.has_pos_embed = "hook_pos_embed" in self.cache_dict
+        # Device for tensors this cache allocates (empty stacks). None → inferred from cache_dict,
+        # not from model.cfg.device, which diverges after cache.to() or on Bridge/meta models.
+        self.device: Optional[torch.device] = torch.device(device) if device is not None else None
+        self._warned_device_inference = False
 
         # Note: model reference prevents garbage collection. Set cache.model = None if unneeded.
+
+    def _resolve_device(
+        self,
+        device: Optional[Union[str, torch.device]],
+        src: torch.Tensor,
+        stacklevel: int = 3,
+    ) -> torch.device:
+        """Device for an allocation: explicit arg, then constructor device, then inferred from src."""
+        if device is not None:
+            return torch.device(device)
+        if self.device is not None:
+            return self.device
+        if not self._warned_device_inference:
+            self._warned_device_inference = True
+            warnings.warn(
+                f"ActivationCache inferred device {src.device} from cached activations because no "
+                "`device` was passed to the constructor or this call. Pass `device=` explicitly; "
+                "this inference fallback may change in a future release.",
+                FutureWarning,
+                stacklevel=stacklevel,
+            )
+        return src.device
 
     def remove_batch_dim(self) -> ActivationCache:
         """Remove the Batch Dimension (if a single batch item).
@@ -233,6 +267,8 @@ class ActivationCache:
         """
         warn_if_mps(device)
         self.cache_dict = {key: value.to(device) for key, value in self.cache_dict.items()}
+        # The cache now lives here explicitly; later allocations need no inference.
+        self.device = torch.device(device)
         return self
 
     def toggle_autodiff(self, mode: bool = False):
@@ -760,6 +796,7 @@ class ActivationCache:
         incl_remainder: bool = False,
         pos_slice: Union[Slice, SliceInput] = None,
         apply_ln: bool = False,
+        device: Optional[Union[str, torch.device]] = None,
     ) -> Union[
         Float[torch.Tensor, "num_components *batch_and_pos_dims d_model"],
         Tuple[Float[torch.Tensor, "num_components *batch_and_pos_dims d_model"], List[str]],
@@ -783,6 +820,10 @@ class ActivationCache:
                 A slice object to apply to the pos dimension. Defaults to None, do nothing.
             apply_ln:
                 Whether to apply LayerNorm to the stack.
+            device:
+                Device for the empty stack returned when there are no components (layer 0, no
+                remainder). Defaults to the constructor's ``device``, else the device of the cached
+                activations. Never ``model.cfg.device``, which diverges after ``cache.to()``.
         """
         if not isinstance(pos_slice, Slice):
             pos_slice = Slice(pos_slice)
@@ -823,10 +864,10 @@ class ActivationCache:
             # stacked correctly. This uses the shape of hook_embed, which is pretty janky since it
             # assumes embed is in the cache. But it's hard to explicitly code the shape, since it
             # depends on the pos slice, whether we have a batch dim, etc. And it's pretty messy!
-            components = torch.zeros(
-                0,
-                *pos_slice.apply(self["hook_embed"], dim=-2).shape,
-                device=self.model.cfg.device,
+            empty_src = pos_slice.apply(self["hook_embed"], dim=-2)
+            # new_zeros inherits dtype; cfg.device is wrong after cache.to() or on Bridge models.
+            components = empty_src.new_zeros(
+                (0, *empty_src.shape), device=self._resolve_device(device, empty_src)
             )
 
         if apply_ln:
@@ -955,6 +996,7 @@ class ActivationCache:
         pos_slice: Slice,
         neuron_slice: Slice,
         project_2d: torch.Tensor,
+        device: Optional[Union[str, torch.device]] = None,
     ) -> torch.Tensor:
         """LN-applied neuron stack with projection folded in — no d_mlp×d_model intermediate.
 
@@ -988,8 +1030,10 @@ class ActivationCache:
             components.append((a_l / scale)[..., None] * lin_form_l)
         if not components:
             empty_src = pos_slice.apply(self["hook_embed"], dim=-2)
-            return torch.zeros(
-                0, *empty_src.shape[:-1], project_2d.shape[-1], device=self.model.cfg.device
+            # stacklevel=4: resolve → this helper → stack_neuron_results → caller
+            return empty_src.new_zeros(
+                (0, *empty_src.shape[:-1], project_2d.shape[-1]),
+                device=self._resolve_device(device, empty_src, stacklevel=4),
             )
         stacked = torch.cat(components, dim=-2)
         return einops.rearrange(
@@ -1005,6 +1049,7 @@ class ActivationCache:
         incl_remainder: bool = False,
         apply_ln: bool = False,
         project_output_onto: Optional[torch.Tensor] = None,
+        device: Optional[Union[str, torch.device]] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[str]]]:
         """Stack Neuron Results
 
@@ -1037,6 +1082,10 @@ class ActivationCache:
                 direction analyses; see ``get_neuron_results``). Combined with ``apply_ln=True``,
                 the projection is folded into the analytical cached-scale LN so the
                 ``[..., d_mlp, d_model]`` intermediate is still never materialized.
+            device:
+                Device for the empty stack returned when there are no components (layer 0, no
+                remainder). Defaults to the constructor's ``device``, else the device of the cached
+                activations. Never ``model.cfg.device``, which diverges after ``cache.to()``.
         """
         if layer is None or layer == -1:
             # Default to the residual stream immediately pre unembed
@@ -1064,7 +1113,7 @@ class ActivationCache:
             assert project_2d is not None  # narrow for mypy
             # Analytical LN+projection — no d_mlp×d_model intermediate.
             components = self._stack_neuron_results_apply_ln_projected(
-                layer, pos_slice, neuron_slice, project_2d
+                layer, pos_slice, neuron_slice, project_2d, device=device
             )
             if incl_remainder:
                 # Linearity of cached-scale LN: remainder is LN_s(resid_post) @ p - sum(neurons).
@@ -1111,7 +1160,11 @@ class ActivationCache:
                 empty_shape_src = pos_slice.apply(self["hook_embed"], dim=-2)
                 if project_2d is not None:
                     empty_shape_src = empty_shape_src @ project_2d
-                components = torch.zeros(0, *empty_shape_src.shape, device=self.model.cfg.device)
+                # new_zeros inherits dtype (post-projection when projected); never cfg.device.
+                components = empty_shape_src.new_zeros(
+                    (0, *empty_shape_src.shape),
+                    device=self._resolve_device(device, empty_shape_src),
+                )
 
             if apply_ln:
                 components = self.apply_ln_to_stack(components, layer, pos_slice=pos_slice)
